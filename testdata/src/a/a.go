@@ -65,3 +65,44 @@ func NewUnrestrictedStruct(c int) UnrestrictedStruct {
 	return UnrestrictedStruct{Count: c}
 }
 
+func CompareDirectCommentStruct(d1, d2 DirectCommentStruct) bool {
+	// Defining package is exempt from comparison restrictions:
+	_ = d1.Value == 42
+	_ = d1.Value < 100
+	_ = d1.Address.City == "default"
+	return d1.Value == d2.Value
+}
+
+// ComparableStruct is comparable since its fields are comparable types.
+//constructor:required
+type ComparableStruct struct { // want ComparableStruct:`constructor:required`
+	ID   int
+	Name string
+}
+
+func NewComparableStruct(id int, name string) ComparableStruct {
+	return ComparableStruct{ID: id, Name: name}
+}
+
+func CompareComparableStruct(c1, c2 ComparableStruct) bool {
+	return c1 == c2 || c1 != c2
+}
+
+func (d DirectCommentStruct) GetValue() int {
+	return d.Value
+}
+
+func (d DirectCommentStruct) IsPositive() bool {
+	return d.Value > 0
+}
+
+func (t *TagStruct) GetName() string {
+	return t.Name
+}
+
+func (t *TagStruct) IsAdmin() bool {
+	return t.Name == "admin"
+}
+
+
+

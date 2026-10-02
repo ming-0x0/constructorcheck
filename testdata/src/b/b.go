@@ -160,3 +160,73 @@ func testReadOnlyAccess() {
 	f := a.NewFuncCommentStruct("secret")
 	_ = f.Secret                  // OK
 }
+
+func testComparisons() {
+	d := a.NewDirectCommentStruct(1)
+	d2 := a.NewDirectCommentStruct(2)
+
+	// Comparing struct fields with values:
+	_ = d.Value == 2              // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = 2 == d.Value              // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = d.Value != 2              // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = d.Value < 2               // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = d.Value <= 2              // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = d.Value > 2               // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	_ = d.Value >= 2              // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+
+	// Comparing fields between structs:
+	_ = d.Value == d2.Value       // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+
+	// Comparing nested fields:
+	_ = d.Address.City == "Hanoi" // want `cannot compare field Address of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+
+	// Comparing inline array elements:
+	_ = d.Arr[0] == 1             // want `cannot compare field Arr of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+
+	// Comparing struct instances directly (values):
+	c1 := a.NewComparableStruct(1, "one")
+	c2 := a.NewComparableStruct(2, "two")
+	_ = c1 == c2                  // want `cannot compare a\.ComparableStruct: //constructor:required types cannot be compared directly outside their package`
+	_ = c1 != c2                  // want `cannot compare a\.ComparableStruct: //constructor:required types cannot be compared directly outside their package`
+
+	// Comparing pointer instances:
+	t1 := a.NewTagStruct("test")
+	t2 := a.NewTagStruct("test")
+	_ = t1 == t2                  // want `cannot compare a\.TagStruct: //constructor:required types cannot be compared directly outside their package`
+	_ = t1 != t2                  // want `cannot compare a\.TagStruct: //constructor:required types cannot be compared directly outside their package`
+
+	// Dereferenced pointer comparison (struct value):
+	_ = *t1 == *t2                // want `cannot compare a\.TagStruct: //constructor:required types cannot be compared directly outside their package`
+
+	// Nil comparisons are PERMITTED:
+	_ = t1 == nil                 // OK
+	_ = nil == t1                 // OK
+	_ = t1 != nil                 // OK
+	_ = nil != t1                 // OK
+
+	// Embedded struct field comparison:
+	ed := EmbeddedDirect{
+		DirectCommentStruct: a.NewDirectCommentStruct(1),
+	}
+	_ = ed.Value == 10            // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+
+	// Unrestricted struct comparisons are PERMITTED:
+	u1 := a.NewUnrestrictedStruct(42)
+	u2 := a.NewUnrestrictedStruct(42)
+	_ = u1 == u2                  // OK
+	_ = u1.Count == 42            // OK
+	_ = u1.Count < 100            // OK
+
+	// Method call comparisons are BANNED:
+	_ = d.GetValue() == 1       // want `cannot compare result of method GetValue of a\.DirectCommentStruct: methods of //constructor:required types cannot be used in comparisons outside their package \(encapsulate domain logic in boolean methods like user\.IsAdmin\(\) instead\)`
+	_ = 1 == d.GetValue()       // want `cannot compare result of method GetValue of a\.DirectCommentStruct: methods of //constructor:required types cannot be used in comparisons outside their package \(encapsulate domain logic in boolean methods like user\.IsAdmin\(\) instead\)`
+	_ = t1.GetName() == "admin" // want `cannot compare result of method GetName of a\.TagStruct: methods of //constructor:required types cannot be used in comparisons outside their package \(encapsulate domain logic in boolean methods like user\.IsAdmin\(\) instead\)`
+	_ = "admin" == t1.GetName() // want `cannot compare result of method GetName of a\.TagStruct: methods of //constructor:required types cannot be used in comparisons outside their package \(encapsulate domain logic in boolean methods like user\.IsAdmin\(\) instead\)`
+
+	// Boolean methods used as direct conditions are PERMITTED:
+	if d.IsPositive() { // OK
+	}
+	if !t1.IsAdmin() { // OK
+	}
+}
+
