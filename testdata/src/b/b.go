@@ -85,11 +85,11 @@ func testIndexExpressions() {
 	d.Arr[0]++                    // want `cannot modify field Arr of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
 	_ = &d.Arr[0]                 // want `cannot take the address of field Arr of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
 
-	// Slices and maps mutate shared backing storage, not the struct field itself: deliberately not flagged
-	d.Slice[0] = 42               // OK
-	d.Slice[0]++                  // OK
-	_ = &d.Slice[0]               // OK
-	d.Map["key"] = 42             // OK
+	// Slices and maps mutate elements of struct fields and are prohibited outside defining package:
+	d.Slice[0] = 42               // want `cannot assign to field Slice of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+	d.Slice[0]++                  // want `cannot modify field Slice of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+	_ = &d.Slice[0]               // want `cannot take the address of field Slice of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+	d.Map["key"] = 42             // want `cannot assign to field Map of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
 }
 
 func testRangeLoops() {
@@ -229,4 +229,192 @@ func testComparisons() {
 	if !t1.IsAdmin() { // OK
 	}
 }
+
+func testNonStructInstantiation() {
+	// Type conversion:
+	_ = a.NewStatus("active")      // OK
+	_ = a.Status("active")         // want `cannot instantiate a\.Status with type conversion: must be created using its constructor \(marked with //constructor:required\)`
+	_ = a.NewMyInt(10)             // OK
+	_ = a.MyInt(10)                // want `cannot instantiate a\.MyInt with type conversion: must be created using its constructor \(marked with //constructor:required\)`
+
+	// Literals:
+	_ = a.NewMySlice(1, 2)         // OK
+	_ = a.MySlice{1, 2}            // want `cannot instantiate a\.MySlice with literal: must be created using its constructor \(marked with //constructor:required\)`
+	_ = a.NewMyMap()               // OK
+	_ = a.MyMap{"k": 1}            // want `cannot instantiate a\.MyMap with literal: must be created using its constructor \(marked with //constructor:required\)`
+	_ = a.NewMyArray(1, 2)         // OK
+	_ = a.MyArray{1, 2}            // want `cannot instantiate a\.MyArray with literal: must be created using its constructor \(marked with //constructor:required\)`
+
+	// make() and new():
+	_ = make(a.MySlice, 0)         // want `cannot instantiate a\.MySlice with make\(\): must be created using its constructor \(marked with //constructor:required\)`
+	_ = make(a.MyMap)              // want `cannot instantiate a\.MyMap with make\(\): must be created using its constructor \(marked with //constructor:required\)`
+	_ = new(a.MyInt)               // want `cannot instantiate a\.MyInt with new\(\): must be created using its constructor \(marked with //constructor:required\)`
+	_ = new(a.DirectCommentStruct) // want `cannot instantiate a\.DirectCommentStruct with new\(\): must be created using its constructor \(marked with //constructor:required\)`
+}
+
+func testNonStructWrites() {
+	s := a.NewMySlice(1, 2)
+	s[0] = 10                      // want `cannot assign to element of a\.MySlice: elements of //constructor:required types are read-only outside their package`
+	s[0]++                         // want `cannot modify element of a\.MySlice: elements of //constructor:required types are read-only outside their package`
+	_ = &s[0]                      // want `cannot take the address of element of a\.MySlice: elements of //constructor:required types are read-only outside their package`
+
+	m := a.NewMyMap()
+	m["k"] = 10                    // want `cannot assign to element of a\.MyMap: elements of //constructor:required types are read-only outside their package`
+
+	arr := a.NewMyArray(1, 2)
+	arr[0] = 10                    // want `cannot assign to element of a\.MyArray: elements of //constructor:required types are read-only outside their package`
+	arr[0]--                       // want `cannot modify element of a\.MyArray: elements of //constructor:required types are read-only outside their package`
+	_ = &arr[0]                    // want `cannot take the address of element of a\.MyArray: elements of //constructor:required types are read-only outside their package`
+
+	num := a.NewMyInt(10)
+	pNum := &num
+	*pNum = 20                     // want `cannot assign to value of a\.MyInt: //constructor:required types are read-only outside their package`
+	(*pNum)++                      // want `cannot modify value of a\.MyInt: //constructor:required types are read-only outside their package`
+	_ = &*pNum                     // want `cannot take the address of value of a\.MyInt: //constructor:required types are read-only outside their package`
+}
+
+func testNonStructComparisons() {
+	st1 := a.NewStatus("active")
+	st2 := a.NewStatus("inactive")
+	_ = st1 == "active"            // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	_ = "active" == st1            // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	_ = st1 != st2                 // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	_ = st1.Raw() == "active"      // want `cannot compare result of method Raw of a\.Status: methods of //constructor:required types cannot be used in comparisons outside their package \(encapsulate domain logic in boolean methods like user\.IsAdmin\(\) instead\)`
+
+	if st1.IsActive() {            // OK
+	}
+
+	num1 := a.NewMyInt(1)
+	num2 := a.NewMyInt(2)
+	_ = num1 == num2               // want `cannot compare a\.MyInt: //constructor:required types cannot be compared directly outside their package`
+	_ = num1 < 2                   // want `cannot compare a\.MyInt: //constructor:required types cannot be compared directly outside their package`
+	_ = 2 >= num1                  // want `cannot compare a\.MyInt: //constructor:required types cannot be compared directly outside their package`
+	if num1.IsZero() {             // OK
+	}
+
+	slice := a.NewMySlice(1)
+	_ = slice[0] == 1              // want `cannot compare element of a\.MySlice: elements of //constructor:required types cannot be compared outside their package`
+	_ = slice == nil               // OK
+	_ = nil != slice               // OK
+
+	arr := a.NewMyArray(1, 2)
+	_ = arr[0] == 1                // want `cannot compare element of a\.MyArray: elements of //constructor:required types cannot be compared outside their package`
+
+	pNum := &num1
+	_ = pNum == nil                // OK
+}
+
+func testSwitchStatements() {
+	d := a.NewDirectCommentStruct(1)
+	switch d.Value { // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+	case 1:
+	}
+
+	st := a.NewStatus("active")
+	switch st { // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	case "active":
+	}
+
+	x := a.NewStatus("inactive")
+	switch x { // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	case "inactive":
+	}
+
+	var anyVal any
+	switch anyVal {
+	case st: // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	}
+
+	slice := a.NewMySlice(1)
+	switch slice[0] { // want `cannot compare element of a\.MySlice: elements of //constructor:required types cannot be compared outside their package`
+	case 1:
+	}
+
+	switch d.GetValue() { // want `cannot compare result of method GetValue of a\.DirectCommentStruct: methods of //constructor:required types cannot be used in comparisons outside their package`
+	case 1:
+	}
+
+	// Untagged switch with method calls in case condition must be PERMITTED:
+	switch {
+	case d.IsPositive(): // OK
+	case st.IsActive():  // OK
+	}
+}
+
+func testBuiltinMutations() {
+	slice := a.NewMySlice(1, 2)
+	deleteTarget := a.NewMyMap()
+
+	delete(deleteTarget, "k")  // want `cannot modify element of a\.MyMap: elements of //constructor:required types are read-only outside their package`
+	clear(slice)               // want `cannot modify element of a\.MySlice: elements of //constructor:required types are read-only outside their package`
+	copy(slice, []int{10, 20}) // want `cannot modify element of a\.MySlice: elements of //constructor:required types are read-only outside their package`
+
+	d := a.NewDirectCommentStruct(1)
+	delete(d.Map, "k")       // want `cannot modify field Map of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+	copy(d.Slice, []int{10}) // want `cannot modify field Slice of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+}
+
+func testSliceOfStruct() {
+	ss := a.NewStructSlice()
+	ss[0].Value = 42      // want `cannot assign to field Value of a\.DirectCommentStruct: fields of //constructor:required types are read-only outside their package`
+	_ = ss[0].Value == 42 // want `cannot compare field Value of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+}
+
+func testTagsAndDirectivesTightMatching() {
+	// FalseTagStruct has no valid constructor tag:
+	_ = a.FalseTagStruct{ID: 10} // OK
+
+	// FalseDirectiveStruct has constructor:requiredFoo which should be ignored:
+	_ = a.FalseDirectiveStruct{ID: 10} // OK
+
+	// PrimaryType is marked via constructor, but SecondaryType is not:
+	_ = a.SecondaryType{Data: "allowed"} // OK
+	_ = a.PrimaryType{Count: 1}          // want `cannot instantiate a\.PrimaryType with struct literal: must be created using its constructor \(marked with //constructor:required\)`
+}
+
+func testTypeAliases() {
+	_ = a.StatusAlias("active") // want `cannot instantiate a\.Status with type conversion: must be created using its constructor \(marked with //constructor:required\)`
+	sa := a.NewStatus("active")
+	_ = sa == "active" // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+}
+
+func testVarZeroValue() {
+	var u a.DirectCommentStruct // want `cannot declare zero value of a\.DirectCommentStruct: must be created using its constructor \(marked with //constructor:required\)`
+	_ = u
+	var s a.Status // want `cannot declare zero value of a\.Status: must be created using its constructor \(marked with //constructor:required\)`
+	_ = s
+	var p *a.DirectCommentStruct // OK: pointer is nil
+	_ = p
+	var ps *a.Status // OK: pointer is nil
+	_ = ps
+	var r a.Repo // OK: interface is nil
+	_ = r
+	var initialized = a.NewDirectCommentStruct(1) // OK
+	_ = initialized
+}
+
+func testComparisonTypeConversions() {
+	st := a.NewStatus("active")
+	_ = string(st) == "active" // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	_ = "active" == string(st) // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+
+	num := a.NewMyInt(1)
+	_ = int(num) > 0 // want `cannot compare a\.MyInt: //constructor:required types cannot be compared directly outside their package`
+
+	// Parentheses around type conversions:
+	_ = (string(st)) == "active"       // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+	_ = ((string((st)))) == "active"   // want `cannot compare a\.Status: //constructor:required types cannot be compared directly outside their package`
+
+	d := a.NewDirectCommentStruct(1)
+	_ = string(d.Address.City) == "Hanoi" // want `cannot compare field Address of a\.DirectCommentStruct: fields of //constructor:required types cannot be compared outside their package`
+}
+
+func testPointerConversions() {
+	d := a.NewDirectCommentStruct(1)
+	dp := &d
+	// Pointer type conversion (*T)(p) does not instantiate a new value, allowed:
+	_ = (*a.DirectCommentStruct)(dp) // OK
+}
+
+
 

@@ -1,31 +1,35 @@
 // Package constructorcheck is a go/analysis analyzer that enforces three rules
-// for structs marked with "constructor:required":
+// for types marked with "constructor:required":
 //
-//  1. INSTANTIATION rule: outside the defining package, the struct must not
-//     be created with a composite literal (User{...}, &User{...}). It must be
-//     created via its constructor (NewUser).
+//  1. INSTANTIATION rule: outside the defining package, the type must not
+//     be created with a literal (User{...}, MySlice{...}), type conversion
+//     (MyInt(x)), built-in make/new (make(MySlice), new(User)), or zero-value
+//     declaration (var u User). It must be created via its constructor (NewUser).
 //
-//  2. READ-ONLY rule: outside the defining package, fields of the struct must
-//     not be written (u.ID = 2, u.ID++, &u.ID, ...). To change state, callers
-//     must go through methods provided by the defining package.
+//  2. READ-ONLY rule: outside the defining package, fields and elements of the type must
+//     not be written (u.ID = 2, s[0] = 2, *p = 2, copy(s, ...), delete(m, ...)).
+//     To change state, callers must go through methods provided by the defining package.
 //
-//  3. NO-COMPARISON rule: outside the defining package, neither the struct
-//     itself, its fields, nor the results of its methods may be compared
-//     (u.ID == 2, u.GetID() == 2, u1 == u2, ...). Callers must rely on
-//     encapsulated domain methods (e.g. u.IsAdmin()).
+//  3. NO-COMPARISON rule: outside the defining package, neither the type
+//     itself, its fields, its elements, nor the results of its methods may be compared
+//     (u.ID == 2, s[0] == 2, status == "active", switch u.ID { ... }). Callers must rely on
+//     encapsulated domain methods (e.g. u.IsAdmin(), s.IsActive()).
 //
-// A struct can be marked in any of these ways:
+// A type can be marked in any of these ways:
 //
 //	// 1. Directive on the type declaration
 //	//constructor:required
 //	type User struct { ID int }
 //
-//	// 2. Directive on the constructor (the type is inferred from the
-//	//    function's return type)
 //	//constructor:required
-//	func NewUser(id int) *User { return &User{ID: id} }
+//	type Status string
 //
-//	// 3. Struct tag on any field
+//	// 2. Directive on the constructor (the type is inferred from the
+//	//    function's primary return type)
+//	//constructor:required
+//	func NewUser(id int) (*User, error) { return &User{ID: id}, nil }
+//
+//	// 3. Struct tag on any field (for structs)
 //	type User struct {
 //	    ID int `constructor:"required"`
 //	}
@@ -35,6 +39,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"reflect"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -43,11 +48,11 @@ import (
 )
 
 // Doc is the description shown by `-help` or in golangci-lint.
-const Doc = `constructorcheck verifies that structs marked with //constructor:required
+const Doc = `constructorcheck verifies that types marked with //constructor:required
 (via a doc-comment directive on the type or its constructor, or a
 constructor:"required" struct tag) are instantiated exclusively via
-constructor functions, that their fields are never modified outside
-the defining package, and that neither the structs, their fields, nor
+constructor functions, that their fields and elements are never modified outside
+the defining package, and that neither the types, their fields/elements, nor
 their method results are compared directly outside the defining package.`
 
 // Analyzer is the entry point of the analyzer. Register it with
@@ -71,46 +76,99 @@ var Analyzer = &analysis.Analyzer{
 
 // requiredFact marks a *types.TypeName as constructor-required. It carries no
 // payload; its mere presence on an object is the signal.
-//
-// Why use a Fact?
-// When analyzing package B, which imports package A, we need to know which of
-// A's types are marked. A Fact lets A "send" that information to B without B
-// having to re-parse A's source. The driver also caches facts, so repeated
-// runs (e.g. under golangci-lint) are fast.
 type requiredFact struct{}
 
-// AFact is the marker method required for requiredFact to satisfy the
-// analysis.Fact interface.
 func (*requiredFact) AFact() {}
 
-// String is used when printing the fact (debugging, analysistest).
 func (*requiredFact) String() string { return "constructor:required" }
 
-// required is a single shared instance. Since requiredFact is empty and the
-// driver only reads it, we can reuse one pointer for every Export/Import call
-// instead of allocating a new one each time.
 var required = new(requiredFact)
+
+// ---------------------------------------------------------------------------
+// Checker Context (per-pass)
+// ---------------------------------------------------------------------------
+
+type checker struct {
+	pass  *analysis.Pass
+	cache map[*types.TypeName]bool
+}
+
+func newChecker(pass *analysis.Pass) *checker {
+	return &checker{
+		pass:  pass,
+		cache: make(map[*types.TypeName]bool),
+	}
+}
+
+func (c *checker) isFactRequired(obj *types.TypeName) bool {
+	if val, ok := c.cache[obj]; ok {
+		return val
+	}
+	res := c.pass.ImportObjectFact(obj, required)
+	c.cache[obj] = res
+	return res
+}
+
+// isSamePackageOrTest returns true if pkg is the analyzed package or an external
+// test package for the analyzed package (e.g. pkg "foo" and "foo_test").
+func isSamePackageOrTest(pass *analysis.Pass, pkg *types.Package) bool {
+	if pkg == pass.Pkg {
+		return true
+	}
+	if pkg == nil || pass.Pkg == nil {
+		return false
+	}
+	if pass.Pkg.Name() == pkg.Name()+"_test" {
+		if strings.TrimSuffix(pass.Pkg.Path(), "_test") == pkg.Path() {
+			return true
+		}
+	}
+	return false
+}
+
+// foreignRequired returns TypeName if t (or *t) is a constructor-required
+// type defined in another package (excluding external test packages).
+func (c *checker) foreignRequired(t types.Type) *types.TypeName {
+	if t == nil {
+		return nil
+	}
+	named, ok := types.Unalias(deref(t)).(*types.Named)
+	if !ok {
+		return nil
+	}
+	obj := named.Obj()
+	if obj == nil || obj.Pkg() == nil || isSamePackageOrTest(c.pass, obj.Pkg()) || !c.isFactRequired(obj) {
+		return nil
+	}
+	return obj
+}
+
+// deref strips one level of pointer and unwraps type aliases.
+func deref(t types.Type) types.Type {
+	if t == nil {
+		return nil
+	}
+	t = types.Unalias(t)
+	if ptr, ok := t.(*types.Pointer); ok {
+		return types.Unalias(ptr.Elem())
+	}
+	return t
+}
 
 // ---------------------------------------------------------------------------
 // Node filter
 // ---------------------------------------------------------------------------
 
-// nodeFilter lists the node kinds we care about. The inspector only invokes
-// the callback for these kinds and skips the rest of the AST.
-//
-//   - CompositeLit: instantiation rule (User{...})
-//   - AssignStmt:   u.ID = 2, u.ID += 1, u.A, u.B = 1, 2
-//   - IncDecStmt:   u.ID++, u.ID--
-//   - RangeStmt:    for u.ID = range xs
-//   - UnaryExpr:    &u.ID (taking an address allows indirect writes)
-//   - BinaryExpr:   u.ID == 2, u1 == u2, ... (comparison rule)
 var nodeFilter = []ast.Node{
 	(*ast.CompositeLit)(nil),
+	(*ast.CallExpr)(nil),
+	(*ast.ValueSpec)(nil),
 	(*ast.AssignStmt)(nil),
 	(*ast.IncDecStmt)(nil),
 	(*ast.RangeStmt)(nil),
 	(*ast.UnaryExpr)(nil),
 	(*ast.BinaryExpr)(nil),
+	(*ast.SwitchStmt)(nil),
 }
 
 // ---------------------------------------------------------------------------
@@ -118,71 +176,102 @@ var nodeFilter = []ast.Node{
 // ---------------------------------------------------------------------------
 
 func run(pass *analysis.Pass) (any, error) {
-	// STEP 1: export a fact for every marked type in the CURRENT package.
-	// Packages importing this one will read these facts in STEP 2.
-	// This must run BEFORE the early return below, because a package with no
-	// imports can still be the one that defines a required struct.
+	// STEP 1: export facts for marked types in the CURRENT package.
 	exportRequiredFacts(pass)
 
-	// Optimization: a package with no imports cannot reference types from
-	// other packages, so it cannot contain a violation. Skip the AST walk.
+	// Optimization: if no imports, cannot reference types from other packages.
 	if len(pass.Pkg.Imports()) == 0 {
 		return nil, nil
 	}
 
+	// Optimization: if no imported facts from other packages, skip AST walk.
+	hasForeign := false
+	for _, f := range pass.AllObjectFacts() {
+		if !isSamePackageOrTest(pass, f.Object.Pkg()) {
+			hasForeign = true
+			break
+		}
+	}
+	if !hasForeign {
+		return nil, nil
+	}
+
+	// Identify generated files to skip checking them.
+	type fileRange struct {
+		start token.Pos
+		end   token.Pos
+	}
+	var generatedRanges []fileRange
+	for _, file := range pass.Files {
+		if ast.IsGenerated(file) {
+			generatedRanges = append(generatedRanges, fileRange{
+				start: file.FileStart,
+				end:   file.FileEnd,
+			})
+		}
+	}
+
+	isGenerated := func(pos token.Pos) bool {
+		for _, r := range generatedRanges {
+			if pos >= r.start && pos < r.end {
+				return true
+			}
+		}
+		return false
+	}
+
 	// STEP 2: walk the AST looking for violations.
+	c := newChecker(pass)
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
+		if isGenerated(n.Pos()) {
+			return
+		}
+
 		switch n := n.(type) {
 
 		case *ast.CompositeLit:
-			// Instantiation rule: User{...} / &User{...}
-			checkCompositeLit(pass, n)
+			c.checkCompositeLit(n)
+
+		case *ast.CallExpr:
+			c.checkCallExpr(n)
+
+		case *ast.ValueSpec:
+			c.checkValueSpec(n)
 
 		case *ast.AssignStmt:
-			// `:=` only declares new identifiers, never a selector such as
-			// u.ID, so skip it. All other tokens (`=`, `+=`, `-=`, ...) must
-			// have every left-hand side checked, since multi-assignment is
-			// possible: u.A, other.B = 1, 2
 			if n.Tok == token.DEFINE {
 				return
 			}
 			for _, lhs := range n.Lhs {
-				checkFieldWrite(pass, lhs, "assign to")
+				c.checkWrite(lhs, "assign to")
 			}
 
 		case *ast.IncDecStmt:
-			// u.ID++ / u.ID--
-			checkFieldWrite(pass, n.X, "modify")
+			c.checkWrite(n.X, "modify")
 
 		case *ast.RangeStmt:
-			// `for u.ID = range xs` (Tok == ASSIGN) writes to u.ID on every
-			// iteration. `for i := range xs` (Tok == DEFINE) only declares
-			// new variables.
 			if n.Tok != token.ASSIGN {
 				return
 			}
 			if n.Key != nil {
-				checkFieldWrite(pass, n.Key, "assign to")
+				c.checkWrite(n.Key, "assign to")
 			}
 			if n.Value != nil {
-				checkFieldWrite(pass, n.Value, "assign to")
+				c.checkWrite(n.Value, "assign to")
 			}
 
 		case *ast.UnaryExpr:
-			// &u.ID yields a writable pointer, which counts as an indirect
-			// write. Note: &User{} is also a UnaryExpr, but its operand is a
-			// CompositeLit, so findRequiredFieldOwner ignores it (default
-			// branch); the instantiation rule is already handled by the
-			// CompositeLit case above.
 			if n.Op == token.AND {
-				checkFieldWrite(pass, n.X, "take the address of")
+				c.checkWrite(n.X, "take the address of")
 			}
 
 		case *ast.BinaryExpr:
-			// Comparison rule: u.ID == 2, u1 == u2, ...
-			checkComparison(pass, n)
+			c.checkComparison(n)
+
+		case *ast.SwitchStmt:
+			c.checkSwitchStmt(n)
 		}
 	})
 
@@ -190,62 +279,135 @@ func run(pass *analysis.Pass) (any, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 1: instantiation via composite literal
+// Rule 1: instantiation via literal, type conversion, make, new, or var declaration
 // ---------------------------------------------------------------------------
 
-// checkCompositeLit reports an error if lit creates a constructor-required
-// struct that belongs to another package.
-func checkCompositeLit(pass *analysis.Pass, lit *ast.CompositeLit) {
-	tv, ok := pass.TypesInfo.Types[lit]
+func (c *checker) checkCompositeLit(lit *ast.CompositeLit) {
+	tv, ok := c.pass.TypesInfo.Types[lit]
 	if !ok {
 		return
 	}
-
-	// &User{} and User{} are both treated as the same type, User.
-	named, ok := deref(tv.Type).(*types.Named)
-	if !ok {
+	obj := c.foreignRequired(tv.Type)
+	if obj == nil {
 		return
 	}
 
-	obj := named.Obj()
-	if obj == nil || obj.Pkg() == nil {
-		return
+	kind := "literal"
+	if _, isStruct := types.Unalias(obj.Type().Underlying()).(*types.Struct); isStruct {
+		kind = "struct literal"
 	}
 
-	// The defining package is exempt: the constructor has to be able to
-	// build the value. Pointer comparison is valid and cheaper than comparing
-	// paths: within a single pass, every object declared in the analyzed
-	// package has Pkg() == pass.Pkg by construction.
-	if obj.Pkg() == pass.Pkg {
-		return
-	}
-
-	// Is this type marked? (the fact is exported by the defining package)
-	if !pass.ImportObjectFact(obj, required) {
-		return
-	}
-
-	pass.Reportf(
+	c.pass.Reportf(
 		lit.Pos(),
-		"cannot instantiate %s.%s with struct literal: must be created using its constructor (marked with //constructor:required)",
+		"cannot instantiate %s.%s with %s: must be created using its constructor (marked with //constructor:required)",
 		obj.Pkg().Name(),
 		obj.Name(),
+		kind,
 	)
 }
 
+func (c *checker) checkCallExpr(call *ast.CallExpr) {
+	// Case 1: Type conversion: T(x), e.g. a.MyInt(10), a.Status("active")
+	if tv, ok := c.pass.TypesInfo.Types[call.Fun]; ok && tv.IsType() {
+		if _, isPtr := types.Unalias(tv.Type).(*types.Pointer); !isPtr {
+			if obj := c.foreignRequired(tv.Type); obj != nil {
+				c.pass.Reportf(
+					call.Pos(),
+					"cannot instantiate %s.%s with type conversion: must be created using its constructor (marked with //constructor:required)",
+					obj.Pkg().Name(),
+					obj.Name(),
+				)
+				return
+			}
+		}
+	}
+
+	// Case 2: Built-ins: make, new, delete, clear, copy
+	ident, ok := unwrapIdent(call.Fun)
+	if !ok {
+		return
+	}
+	builtin, ok := c.pass.TypesInfo.Uses[ident].(*types.Builtin)
+	if !ok || len(call.Args) == 0 {
+		return
+	}
+
+	switch builtin.Name() {
+	case "make", "new":
+		argTv, ok := c.pass.TypesInfo.Types[call.Args[0]]
+		if !ok || !argTv.IsType() {
+			return
+		}
+		if obj := c.foreignRequired(argTv.Type); obj != nil {
+			c.pass.Reportf(
+				call.Pos(),
+				"cannot instantiate %s.%s with %s(): must be created using its constructor (marked with //constructor:required)",
+				obj.Pkg().Name(),
+				obj.Name(),
+				builtin.Name(),
+			)
+		}
+
+	case "delete", "clear", "copy":
+		// If arg[0] is a field (e.g. delete(u.Meta, k), copy(u.Tags, x)), checkWrite catches it.
+		if !c.checkWrite(call.Args[0], "modify") {
+			// Otherwise, check if arg[0] itself is a constructor-required collection.
+			argType := c.pass.TypesInfo.TypeOf(call.Args[0])
+			if obj := c.foreignRequired(argType); obj != nil {
+				c.pass.Reportf(
+					call.Pos(),
+					"cannot modify element of %s.%s: elements of //constructor:required types are read-only outside their package (use a method provided by the package instead)",
+					obj.Pkg().Name(),
+					obj.Name(),
+				)
+			}
+		}
+	}
+}
+
+func (c *checker) checkValueSpec(spec *ast.ValueSpec) {
+	// Flag uninitialized variable declarations, e.g. var u user.User
+	if spec.Type == nil || len(spec.Values) > 0 {
+		return
+	}
+	t := c.pass.TypesInfo.TypeOf(spec.Type)
+	if t == nil {
+		return
+	}
+	// Pointers and interfaces default to nil, which is valid and does not instantiate a value.
+	switch types.Unalias(t).Underlying().(type) {
+	case *types.Pointer, *types.Interface:
+		return
+	}
+	if obj := c.foreignRequired(t); obj != nil {
+		c.pass.Reportf(
+			spec.Pos(),
+			"cannot declare zero value of %s.%s: must be created using its constructor (marked with //constructor:required)",
+			obj.Pkg().Name(),
+			obj.Name(),
+		)
+	}
+}
+
+func unwrapIdent(expr ast.Expr) (*ast.Ident, bool) {
+	for {
+		if paren, ok := expr.(*ast.ParenExpr); ok {
+			expr = paren.X
+			continue
+		}
+		break
+	}
+	ident, ok := expr.(*ast.Ident)
+	return ident, ok
+}
+
 // ---------------------------------------------------------------------------
-// Rule 2: fields are read-only outside the defining package
+// Rule 2: fields and elements are read-only outside the defining package
 // ---------------------------------------------------------------------------
 
-// checkFieldWrite reports an error if target (the left-hand side of a write,
-// the operand of ++/--, or the operand of &) resolves to a field of a
-// constructor-required struct that lives in another package.
-//
-// verb describes the offending operation and is used in the message, e.g.
-// "assign to", "modify" or "take the address of".
-func checkFieldWrite(pass *analysis.Pass, target ast.Expr, verb string) {
-	if owner, fieldName := findRequiredFieldOwner(pass, target); owner != nil {
-		pass.Reportf(
+func (c *checker) checkWrite(target ast.Expr, verb string) bool {
+	if owner, fieldName := c.findRequiredFieldOwner(target); owner != nil {
+		c.pass.Reportf(
 			target.Pos(),
 			"cannot %s field %s of %s.%s: fields of //constructor:required types are read-only outside their package (use a method provided by the package instead)",
 			verb,
@@ -253,186 +415,219 @@ func checkFieldWrite(pass *analysis.Pass, target ast.Expr, verb string) {
 			owner.Pkg().Name(),
 			owner.Name(),
 		)
+		return true
+	}
+	if owner := c.findRequiredElementOwner(target); owner != nil {
+		c.pass.Reportf(
+			target.Pos(),
+			"cannot %s element of %s.%s: elements of //constructor:required types are read-only outside their package (use a method provided by the package instead)",
+			verb,
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	if owner := c.findRequiredValueOwner(target); owner != nil {
+		c.pass.Reportf(
+			target.Pos(),
+			"cannot %s value of %s.%s: //constructor:required types are read-only outside their package (use a method provided by the package instead)",
+			verb,
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	return false
+}
+
+func (c *checker) findRequiredElementOwner(target ast.Expr) *types.TypeName {
+	expr := target
+	for {
+		switch e := expr.(type) {
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.SelectorExpr:
+			expr = e.X
+		case *ast.IndexExpr:
+			if owner := c.foreignRequired(c.pass.TypesInfo.TypeOf(e.X)); owner != nil {
+				return owner
+			}
+			expr = e.X
+		default:
+			return nil
+		}
 	}
 }
 
-// findRequiredFieldOwner checks whether expr resolves to a field of a
-// constructor-required struct that lives in another package. If so, it returns
-// the owning type and the field name; otherwise it returns (nil, "").
-//
-// It is shared by Rule 2 (writes) and Rule 3 (comparisons).
-//
-// The function walks the expression chain from the outside in, so nested
-// accesses are attributed to the required struct that actually owns the memory:
-//
-//	u.ID                  -> selector ID on User             (caught immediately)
-//	u.Address.City        -> City belongs to Address (not marked), but Address
-//	                         is stored INLINE in User        (caught at Address)
-//	u.Arr[0]              -> Arr is an array stored inline in User (caught at Arr)
-//	u.Ptr.X               -> Ptr is a pointer; X lives in different memory that
-//	                         User does NOT own               (stop, no report)
-func findRequiredFieldOwner(pass *analysis.Pass, target ast.Expr) (*types.TypeName, string) {
+func (c *checker) findRequiredValueOwner(target ast.Expr) *types.TypeName {
+	expr := target
+	for {
+		switch e := expr.(type) {
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.StarExpr:
+			t := c.pass.TypesInfo.TypeOf(e.X)
+			if t != nil {
+				if ptr, ok := types.Unalias(t).(*types.Pointer); ok {
+					if obj := c.foreignRequired(ptr.Elem()); obj != nil {
+						return obj
+					}
+				}
+			}
+			expr = e.X
+		default:
+			return nil
+		}
+	}
+}
+
+func (c *checker) findRequiredFieldOwner(target ast.Expr) (*types.TypeName, string) {
 	expr := target
 
 	for {
 		switch e := expr.(type) {
 
 		case *ast.ParenExpr:
-			// (u.ID) -> unwrap the parentheses.
 			expr = e.X
 
 		case *ast.IndexExpr:
-			// Only ARRAYS are stored inline in the struct: u.Arr[0]
-			// accesses the struct's own memory.
-			// SLICES and MAPS are different: u.Tags[0] or u.Meta["k"]
-			// only access shared backing storage, not the field itself.
-			t := pass.TypesInfo.TypeOf(e.X)
+			t := c.pass.TypesInfo.TypeOf(e.X)
 			if t == nil {
 				return nil, ""
 			}
-			if _, isArr := t.Underlying().(*types.Array); !isArr {
+			switch types.Unalias(t).Underlying().(type) {
+			case *types.Array, *types.Slice, *types.Map:
+				expr = e.X
+			default:
 				return nil, ""
 			}
-			expr = e.X
 
 		case *ast.SelectorExpr:
-			// Selections only contains field/method selectors. A
-			// package-qualified selector (pkg.Var) is not in the map, so
-			// sel == nil for it.
-			sel := pass.TypesInfo.Selections[e]
+			sel := c.pass.TypesInfo.Selections[e]
 			if sel == nil || sel.Kind() != types.FieldVal {
-				// pkg.Var, method value (u.Method), ... -> not a field access.
 				return nil, ""
 			}
 
-			// Does this field belong to a constructor-required struct from
-			// another package? This also handles fields promoted through
-			// embedded structs.
-			if owner := requiredOwner(pass, sel); owner != nil {
+			if owner := c.requiredOwner(sel); owner != nil {
 				return owner, sel.Obj().Name()
 			}
 
-			// No forbidden owner found yet. Continue inward (e.X) to see
-			// whether the enclosing expression is stored inline in a
-			// forbidden struct.
-			//
-			// EXCEPTION: if e.X is a pointer, the access goes through the
-			// pointer and that memory is not owned by the enclosing struct,
-			// so stop here to avoid false positives.
-			if xt := pass.TypesInfo.TypeOf(e.X); xt != nil {
-				if _, isPtr := xt.Underlying().(*types.Pointer); isPtr {
+			if xt := c.pass.TypesInfo.TypeOf(e.X); xt != nil {
+				if _, isPtr := types.Unalias(xt).Underlying().(*types.Pointer); isPtr {
 					return nil, ""
 				}
 			}
 			expr = e.X
 
 		default:
-			// A bare identifier, function call, composite literal, ...
 			return nil, ""
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: fields, methods, and structs cannot be compared outside defining package
+// Rule 3: fields, elements, methods, and types cannot be compared outside defining package
 // ---------------------------------------------------------------------------
 
-// checkComparison reports an error if a comparison operator
-// (==, !=, <, <=, >, >=) involves, outside the defining package:
-//
-//  1. a field of a constructor-required struct,
-//  2. the result of a method call on a constructor-required struct, or
-//  3. a constructor-required struct itself (value or pointer).
-//
-// Comparing a pointer with nil (p == nil, p != nil) is always permitted.
-// Only the first violation found is reported, to avoid duplicate diagnostics
-// for the same expression.
-func checkComparison(pass *analysis.Pass, bin *ast.BinaryExpr) {
+func (c *checker) checkComparisonExpr(expr ast.Expr, pos token.Pos) bool {
+	if expr == nil || isNil(expr) {
+		return false
+	}
+
+	// Unwrap parentheses and type conversions T(x) e.g. (string(s)) == "x"
+	for {
+		if p, ok := expr.(*ast.ParenExpr); ok {
+			expr = p.X
+			continue
+		}
+		call, ok := expr.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			break
+		}
+		if tv, ok := c.pass.TypesInfo.Types[call.Fun]; !ok || !tv.IsType() {
+			break
+		}
+		expr = call.Args[0]
+	}
+
+	if owner, fieldName := c.findRequiredFieldOwner(expr); owner != nil {
+		c.pass.Reportf(
+			pos,
+			"cannot compare field %s of %s.%s: fields of //constructor:required types cannot be compared outside their package (use a method provided by the package instead)",
+			fieldName,
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	if owner := c.findRequiredElementOwner(expr); owner != nil {
+		c.pass.Reportf(
+			pos,
+			"cannot compare element of %s.%s: elements of //constructor:required types cannot be compared outside their package (use a method provided by the package instead)",
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	if owner, methodName := c.findRequiredMethodOwner(expr); owner != nil {
+		c.pass.Reportf(
+			pos,
+			"cannot compare result of method %s of %s.%s: methods of //constructor:required types cannot be used in comparisons outside their package (encapsulate domain logic in boolean methods like user.IsAdmin() instead)",
+			methodName,
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	if owner := c.requiredNamedType(expr); owner != nil {
+		c.pass.Reportf(
+			pos,
+			"cannot compare %s.%s: //constructor:required types cannot be compared directly outside their package (use a method provided by the package instead)",
+			owner.Pkg().Name(),
+			owner.Name(),
+		)
+		return true
+	}
+	return false
+}
+
+func (c *checker) checkComparison(bin *ast.BinaryExpr) {
 	switch bin.Op {
 	case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
 	default:
 		return
 	}
 
-	// 1. Either operand is a field of a constructor-required struct.
-	if owner, fieldName := findRequiredFieldOwner(pass, bin.X); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare field %s of %s.%s: fields of //constructor:required types cannot be compared outside their package (use a method provided by the package instead)",
-			fieldName,
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
-	}
-	if owner, fieldName := findRequiredFieldOwner(pass, bin.Y); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare field %s of %s.%s: fields of //constructor:required types cannot be compared outside their package (use a method provided by the package instead)",
-			fieldName,
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
-	}
-
-	// 2. Either operand is a method call on a constructor-required struct.
-	if owner, methodName := findRequiredMethodOwner(pass, bin.X); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare result of method %s of %s.%s: methods of //constructor:required types cannot be used in comparisons outside their package (encapsulate domain logic in boolean methods like user.IsAdmin() instead)",
-			methodName,
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
-	}
-	if owner, methodName := findRequiredMethodOwner(pass, bin.Y); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare result of method %s of %s.%s: methods of //constructor:required types cannot be used in comparisons outside their package (encapsulate domain logic in boolean methods like user.IsAdmin() instead)",
-			methodName,
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
-	}
-
-	// 3. The struct instances themselves are compared (u1 == u2, *p1 == *p2,
-	// p1 == p2). Comparison with nil (p == nil, p != nil) is permitted.
 	if isNil(bin.X) || isNil(bin.Y) {
 		return
 	}
 
-	if owner := requiredStructType(pass, bin.X); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare %s.%s: //constructor:required types cannot be compared directly outside their package (use a method provided by the package instead)",
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
-	}
-	if owner := requiredStructType(pass, bin.Y); owner != nil {
-		pass.Reportf(
-			bin.Pos(),
-			"cannot compare %s.%s: //constructor:required types cannot be compared directly outside their package (use a method provided by the package instead)",
-			owner.Pkg().Name(),
-			owner.Name(),
-		)
-		return
+	for _, e := range []ast.Expr{bin.X, bin.Y} {
+		if c.checkComparisonExpr(e, bin.Pos()) {
+			return
+		}
 	}
 }
 
-// findRequiredMethodOwner checks whether expr is a method call on a
-// constructor-required struct from another package, possibly followed by
-// field selections or index operations on its result. If so, it returns the
-// owning struct type and the method name; otherwise it returns (nil, "").
-//
-//	u.GetID()              -> GetID on User
-//	u.GetAddress().City    -> GetAddress on User (selector on the call result)
-//	u.Tags()[0]            -> Tags on User       (index on the call result)
-func findRequiredMethodOwner(pass *analysis.Pass, target ast.Expr) (*types.TypeName, string) {
+func (c *checker) checkSwitchStmt(sw *ast.SwitchStmt) {
+	if sw.Tag == nil {
+		return // switch { case cond: } -> condition checks are handled by BinaryExpr
+	}
+	if c.checkComparisonExpr(sw.Tag, sw.Tag.Pos()) {
+		return
+	}
+	for _, stmt := range sw.Body.List {
+		if cc, ok := stmt.(*ast.CaseClause); ok {
+			for _, expr := range cc.List {
+				if c.checkComparisonExpr(expr, expr.Pos()) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *checker) findRequiredMethodOwner(target ast.Expr) (*types.TypeName, string) {
 	expr := target
 	for {
 		switch e := expr.(type) {
@@ -441,14 +636,13 @@ func findRequiredMethodOwner(pass *analysis.Pass, target ast.Expr) (*types.TypeN
 		case *ast.IndexExpr:
 			expr = e.X
 		case *ast.SelectorExpr:
-			// Field access on the result of a method call, e.g. user.GetAddress().City
 			expr = e.X
 		case *ast.CallExpr:
 			selExpr, ok := e.Fun.(*ast.SelectorExpr)
 			if !ok {
 				return nil, ""
 			}
-			sel := pass.TypesInfo.Selections[selExpr]
+			sel := c.pass.TypesInfo.Selections[selExpr]
 			if sel == nil || sel.Kind() != types.MethodVal {
 				return nil, ""
 			}
@@ -460,12 +654,7 @@ func findRequiredMethodOwner(pass *analysis.Pass, target ast.Expr) (*types.TypeN
 			if !ok || sig.Recv() == nil {
 				return nil, ""
 			}
-			named, ok := deref(sig.Recv().Type()).(*types.Named)
-			if !ok {
-				return nil, ""
-			}
-			obj := named.Obj()
-			if obj != nil && obj.Pkg() != nil && obj.Pkg() != pass.Pkg && pass.ImportObjectFact(obj, required) {
+			if obj := c.foreignRequired(sig.Recv().Type()); obj != nil {
 				return obj, fn.Name()
 			}
 			return nil, ""
@@ -475,45 +664,13 @@ func findRequiredMethodOwner(pass *analysis.Pass, target ast.Expr) (*types.TypeN
 	}
 }
 
-// requiredStructType returns the TypeName of the constructor-required struct
-// if expr evaluates to that struct (as a value or as a pointer) and the struct
-// is defined in another package. It returns nil otherwise, including when
-// expr is the nil identifier.
-func requiredStructType(pass *analysis.Pass, expr ast.Expr) *types.TypeName {
+func (c *checker) requiredNamedType(expr ast.Expr) *types.TypeName {
 	if expr == nil || isNil(expr) {
 		return nil
 	}
-	t := pass.TypesInfo.TypeOf(expr)
-	if t == nil {
-		return nil
-	}
-
-	// Value: User / package.User
-	if named, ok := t.(*types.Named); ok {
-		if _, isStruct := named.Underlying().(*types.Struct); isStruct {
-			obj := named.Obj()
-			if obj != nil && obj.Pkg() != nil && obj.Pkg() != pass.Pkg && pass.ImportObjectFact(obj, required) {
-				return obj
-			}
-		}
-	}
-
-	// Pointer: *User / *package.User
-	if ptr, ok := t.(*types.Pointer); ok {
-		if named, ok := ptr.Elem().(*types.Named); ok {
-			if _, isStruct := named.Underlying().(*types.Struct); isStruct {
-				obj := named.Obj()
-				if obj != nil && obj.Pkg() != nil && obj.Pkg() != pass.Pkg && pass.ImportObjectFact(obj, required) {
-					return obj
-				}
-			}
-		}
-	}
-
-	return nil
+	return c.foreignRequired(c.pass.TypesInfo.TypeOf(expr))
 }
 
-// isNil reports whether expr is the untyped nil identifier (unwrapping parentheses).
 func isNil(expr ast.Expr) bool {
 	for {
 		if paren, ok := expr.(*ast.ParenExpr); ok {
@@ -532,41 +689,22 @@ func isNil(expr ast.Expr) bool {
 // Helpers shared by the rules
 // ---------------------------------------------------------------------------
 
-// requiredOwner walks the field-selection path (including embedded structs)
-// and returns the first constructor-required type from ANOTHER package, or nil
-// if there is none.
-//
-// Example: for `w.ID`, where W (in the current package) embeds model.User:
-//
-//	type W struct{ model.User }
-//
-// sel.Index() = [0, k] (0 = the embedded User field, k = position of ID in
-// User). We walk W -> User and find that User is marked, so we return User.
-func requiredOwner(pass *analysis.Pass, sel *types.Selection) *types.TypeName {
+func (c *checker) requiredOwner(sel *types.Selection) *types.TypeName {
 	t := sel.Recv()
-	idx := sel.Index() // path: idx[i] is the field index at level i
+	idx := sel.Index()
 
 	for i := 0; ; i++ {
-		// Each level may be a pointer or a value: strip the pointer first.
 		t = deref(t)
 
-		// Is the current level a constructor-required type in another package?
-		if named, ok := t.(*types.Named); ok {
-			obj := named.Obj()
-			if obj != nil && obj.Pkg() != nil && obj.Pkg() != pass.Pkg &&
-				pass.ImportObjectFact(obj, required) {
-				return obj
-			}
+		if obj := c.foreignRequired(t); obj != nil {
+			return obj
 		}
 
-		// The last level (the one holding the selected field) has just been
-		// checked above, so there is nothing left to descend into.
 		if i >= len(idx)-1 {
 			return nil
 		}
 
-		// Descend into the next embedded level.
-		st, ok := t.Underlying().(*types.Struct)
+		st, ok := types.Unalias(t).Underlying().(*types.Struct)
 		if !ok {
 			return nil
 		}
@@ -574,30 +712,18 @@ func requiredOwner(pass *analysis.Pass, sel *types.Selection) *types.TypeName {
 	}
 }
 
-// deref strips one level of pointer: *T -> T, T -> T.
-func deref(t types.Type) types.Type {
-	if ptr, ok := t.(*types.Pointer); ok {
-		return ptr.Elem()
-	}
-	return t
-}
-
 // ---------------------------------------------------------------------------
 // Fact export (defining-package side)
 // ---------------------------------------------------------------------------
 
-// exportRequiredFacts scans the current package's declarations and struct
-// tags for the constructor:required marker and exports a fact for each
-// marked type, so other packages can query it in O(1) via ImportObjectFact.
 func exportRequiredFacts(pass *analysis.Pass) {
-	// Names of types marked via directive (on the type or on a constructor).
 	byDirective := scanPackageRequiredTypes(pass.Files)
 
 	scope := pass.Pkg.Scope()
 	for _, name := range scope.Names() {
 		obj, ok := scope.Lookup(name).(*types.TypeName)
 		if !ok {
-			continue // skip vars, consts, funcs, ...
+			continue
 		}
 		if byDirective[name] || hasRequiredTag(obj) {
 			pass.ExportObjectFact(obj, required)
@@ -605,34 +731,21 @@ func exportRequiredFacts(pass *analysis.Pass) {
 	}
 }
 
-// hasRequiredTag reports whether the type is a struct with at least one field
-// carrying the tag `constructor:"required"`.
 func hasRequiredTag(obj *types.TypeName) bool {
-	st, ok := obj.Type().Underlying().(*types.Struct)
+	st, ok := types.Unalias(obj.Type().Underlying()).(*types.Struct)
 	if !ok {
 		return false
 	}
 	for i := 0; i < st.NumFields(); i++ {
-		if strings.Contains(st.Tag(i), `constructor:"required"`) {
+		tag := reflect.StructTag(st.Tag(i))
+		if tag.Get("constructor") == "required" {
 			return true
 		}
 	}
 	return false
 }
 
-// scanPackageRequiredTypes finds types marked //constructor:required by
-// directive, in two ways:
-//
-//  1. Directly on the type declaration (the GenDecl doc, the TypeSpec doc, or
-//     a trailing comment).
-//  2. Indirectly via a constructor: if `func NewFoo() *Foo` carries the
-//     directive, the named types in its results (Foo) are marked.
-//
-// It returns a set of type names. The result may be nil when the package has
-// no directives; reading from a nil map is safe, so callers need no check.
 func scanPackageRequiredTypes(files []*ast.File) map[string]bool {
-	// Lazily allocated: most packages have no directives at all, so avoid
-	// creating an unused map.
 	var found map[string]bool
 	mark := func(name string) {
 		if found == nil {
@@ -643,16 +756,12 @@ func scanPackageRequiredTypes(files []*ast.File) map[string]bool {
 
 	for _, file := range files {
 		for _, decl := range file.Decls {
-
-			// Case 1: type declarations.
 			if genDecl, ok := decl.(*ast.GenDecl); ok {
-				// `//constructor:required` placed above `type (...)` or
-				// `type X ...` lives in the GenDecl's doc.
 				hasDeclComment := hasConstructorDirective(genDecl.Doc)
 				for _, spec := range genDecl.Specs {
 					typeSpec, ok := spec.(*ast.TypeSpec)
 					if !ok {
-						continue // import/const/var spec
+						continue
 					}
 					if hasDeclComment ||
 						hasConstructorDirective(typeSpec.Doc) ||
@@ -662,7 +771,6 @@ func scanPackageRequiredTypes(files []*ast.File) map[string]bool {
 				}
 			}
 
-			// Case 2: directive on a constructor function.
 			if fnDecl, ok := decl.(*ast.FuncDecl); ok {
 				if hasConstructorDirective(fnDecl.Doc) {
 					for _, retType := range getReturnNamedTypes(fnDecl.Type) {
@@ -676,46 +784,59 @@ func scanPackageRequiredTypes(files []*ast.File) map[string]bool {
 	return found
 }
 
-// getReturnNamedTypes returns the names of the types that appear in the
-// function's results, supporting only `Foo` and `*Foo` where Foo is a plain
-// identifier of the same package. Forms like pkg.Foo, []Foo or map[K]Foo are
-// ignored.
 func getReturnNamedTypes(fnType *ast.FuncType) []string {
 	if fnType == nil || fnType.Results == nil {
 		return nil
 	}
-	var names []string
 	for _, field := range fnType.Results.List {
 		t := field.Type
 		if star, ok := t.(*ast.StarExpr); ok {
-			t = star.X // *Foo -> Foo
+			t = star.X
+		}
+		if idxExpr, ok := t.(*ast.IndexExpr); ok {
+			t = idxExpr.X
+		}
+		if idxList, ok := t.(*ast.IndexListExpr); ok {
+			t = idxList.X
 		}
 		if ident, ok := t.(*ast.Ident); ok {
-			names = append(names, ident.Name)
+			if ident.Name == "error" {
+				continue
+			}
+			return []string{ident.Name}
 		}
+		break
 	}
-	return names
+	return nil
 }
 
-// hasConstructorDirective reports whether a comment group contains a line
-// that starts with `constructor:required`. It accepts the forms
-// `//constructor:required`, `// constructor:required` and
-// `/* constructor:required */`.
-//
-// Matching is prefix-based, so trailing text such as
-// `//constructor:required (explanation)` is allowed.
 func hasConstructorDirective(doc *ast.CommentGroup) bool {
 	if doc == nil {
 		return false
 	}
 	for _, c := range doc.List {
-		// Strip the comment markers and surrounding whitespace, leaving only
-		// the plain text.
-		text := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
-		text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))
-		text = strings.TrimSpace(strings.TrimSuffix(text, "*/"))
-		if strings.HasPrefix(text, "constructor:required") {
-			return true
+		text := c.Text
+		if strings.HasPrefix(text, "//") {
+			line := strings.TrimPrefix(text, "//")
+			// Go directives must not have whitespace between // and the directive name
+			if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+				continue
+			}
+			line = strings.TrimSpace(line)
+			if rem, ok := strings.CutPrefix(line, "constructor:required"); ok {
+				if len(rem) == 0 || rem[0] == ' ' || rem[0] == '\t' || rem[0] == '(' {
+					return true
+				}
+			}
+		} else if strings.HasPrefix(text, "/*") {
+			line := strings.TrimPrefix(text, "/*")
+			line = strings.TrimSuffix(line, "*/")
+			line = strings.TrimSpace(line)
+			if rem, ok := strings.CutPrefix(line, "constructor:required"); ok {
+				if len(rem) == 0 || rem[0] == ' ' || rem[0] == '\t' || rem[0] == '(' {
+					return true
+				}
+			}
 		}
 	}
 	return false
